@@ -76,23 +76,34 @@ Add the same environment variables in Vercel's project settings.
 - Supabase: **Authentication > URL Configuration > Redirect URLs** → add `https://your-app.vercel.app/auth/callback`
 - Google Cloud Console: **OAuth 2.0 Client > Authorized redirect URIs** → add `https://<your-project>.supabase.co/auth/v1/callback`
 
-## Problems Encountered & Solutions
+## Problems Faced & How I Solved Them
 
-### 1. Supabase Auth Cookies in Next.js App Router
-**Problem:** Supabase auth tokens need to be managed as cookies for server-side rendering in the App Router.
-**Solution:** Used `@supabase/ssr` package which provides `createBrowserClient` and `createServerClient` helpers that handle cookie management automatically. Added middleware to refresh auth tokens on every request.
+### 1. Bookmarks Only Appeared After Page Refresh
+**Problem:** After adding a bookmark, it wouldn't show up in the list until the user manually refreshed the page. This was the biggest UX issue I encountered.
 
-### 2. Real-time Updates Only Showing Own Bookmarks
-**Problem:** Supabase Realtime broadcasts `INSERT` events to all subscribers, not just the bookmark owner, which could cause other users' bookmarks to appear in the list.
-**Solution:** Added a client-side check in the real-time subscription callback that verifies `payload.new.user_id === currentUser.id` before adding the bookmark to the local state.
+**Root Cause:** `AddBookmarkForm` and `BookmarkList` were sibling components with no shared state. The form inserted into Supabase, but the list only fetched on mount — there was no communication between them. The Realtime subscription existed but had a race condition where the optimistic update wasn't happening.
 
-### 3. Row Level Security (RLS) with Realtime
-**Problem:** Had to ensure that even with Realtime enabled, users cannot access other users' data.
-**Solution:** Implemented strict RLS policies (`SELECT`, `INSERT`, `DELETE` all scoped to `auth.uid() = user_id`) and added the Realtime publication for the bookmarks table so Postgres broadcasts changes that clients can filter.
+**Solution:** Lifted all bookmark state up into a parent `Dashboard` client component. The form now calls `.select().single()` after insert to get the new row back, then calls an `onBookmarkAdded` callback that immediately updates the shared state (optimistic UI). The Realtime subscription in `Dashboard` handles cross-tab sync with a deduplication check (`prev.some(b => b.id === payload.new.id)`) to avoid double-rendering when both the callback and the Realtime event fire.
 
-### 4. Cookie Handling in Server Components
-**Problem:** `cookies().set()` throws an error when called from a Server Component (read-only context).
-**Solution:** Wrapped `setAll` in a try-catch in the server client — this is expected behavior since middleware handles the actual cookie refresh.
+### 2. Supabase Auth Cookie Management in Next.js App Router
+**Problem:** Supabase auth tokens need to persist as cookies for server-side rendering, but Next.js App Router has strict rules about when cookies can be read vs. written.
+
+**Solution:** Used `@supabase/ssr` which provides `createBrowserClient` (for client components) and `createServerClient` (for server components/route handlers) with built-in cookie adapters. Added Next.js middleware (`middleware.ts`) that calls `updateSession()` on every request to refresh expired tokens before they reach the page.
+
+### 3. `cookies().set()` Throwing in Server Components
+**Problem:** The Supabase server client tries to call `cookies().set()` during token refresh, but Server Components in Next.js are read-only — you can't set cookies from them. This caused runtime errors.
+
+**Solution:** Wrapped the `setAll` callback in a `try-catch` block inside the server client factory. This is safe because the middleware already handles the actual cookie refresh upstream. The server client only needs to *read* cookies to authenticate the request — it doesn't need to write them.
+
+### 4. Realtime Broadcasting to All Users
+**Problem:** Supabase Realtime sends `postgres_changes` events to every connected client, not just the user who owns the bookmark. Without filtering, User A could briefly see User B's bookmarks appear in their list.
+
+**Solution:** Added a client-side guard in the Realtime callback: fetch the current user via `supabase.auth.getUser()` and compare `payload.new.user_id === user.id` before updating state. Combined with Row Level Security (RLS) on the database side (`auth.uid() = user_id` on SELECT/INSERT/DELETE), this provides defense in depth — the database rejects unauthorized access regardless of what the client does.
+
+### 5. Middleware Deprecation Warning in Next.js 16
+**Problem:** Next.js 16 introduced a new `proxy` file convention and shows a deprecation warning for the legacy `middleware.ts` pattern: *"The middleware file convention is deprecated. Please use proxy instead."*
+
+**Solution:** The middleware still works correctly in Next.js 16 — it's a warning, not an error. The `proxy.ts` convention is the recommended path forward, but for compatibility and since Supabase's `@supabase/ssr` documentation currently targets the middleware pattern, I kept it as-is. The warning does not affect functionality.
 
 ## Project Structure
 
